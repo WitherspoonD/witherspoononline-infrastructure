@@ -1,2 +1,2 @@
 # witherspoononline-infrastructure
-a house for terraform code
+a home for terraform code
