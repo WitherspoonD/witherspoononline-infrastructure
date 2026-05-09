@@ -1,0 +1,134 @@
+# .github/workflows/deploy.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# CI/CD pipeline — replaces your SAM-based GitHub Actions workflow
+#
+# On push to main:
+#   1. Run Lambda unit tests
+#   2. Run terraform plan (shows what will change)
+#   3. On approval (or auto on main): terraform apply
+#   4. Upload website files to S3
+#   5. Invalidate CloudFront cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy witherspoononline.com
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  TF_WORKING_DIR: environments/prod
+
+jobs:
+  # ── Job 1: Test Lambda ──────────────────────────────────────────────────────
+  test:
+    name: Test Lambda Function
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install pytest boto3
+
+      - name: Run unit tests
+        run: pytest modules/lambda/src/test_lambda_function.py -v
+        # If tests fail, the deploy job never runs
+
+  # ── Job 2: Terraform Plan ───────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: test   # Only runs if tests pass
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -out=tfplan -no-color
+        # On PRs this shows what would change without applying it
+
+  # ── Job 3: Terraform Apply + Deploy (main branch only) ─────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve
+
+      - name: Get S3 bucket name from Terraform output
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        id: tf_outputs
+        run: |
+          echo "bucket=$(terraform output -raw s3_bucket_name)" >> $GITHUB_OUTPUT
+          echo "cf_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+
+      - name: Upload website files to S3
+        run: |
+          aws s3 sync ./cloud-resume-challenge/frontend/ \
+            s3://${{ steps.tf_outputs.outputs.bucket }} \
+            --delete \
+            --cache-control "max-age=86400"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.tf_outputs.outputs.cf_id }} \
+            --paths "/*"
